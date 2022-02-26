@@ -1,0 +1,638 @@
+---
+title: "Santa Ynez Mountains - Riparian Fire Analysis"
+author: "Conor McMahon"
+date: "12/15/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(raster)
+library(st)
+library(here)
+library(kableExtra)
+library(rgdal)
+
+```
+
+
+This document performs some basic analysis investigating the impacts of fire on riparian zones throughout the Front Range (south-facing slopes) of the Santa Ynez Mountains in Santa Barbara County. The study region grades from sea level in the towns of Goleta and Santa Barbara up to the ridgeline at up to approximately 1200 m. Precipitation varies substantially with elevation, from approximately 430 to 800 mm, with the highest areas receiving the most rain, almost all of which falls between October and April. 
+
+Upland regions in this area are dominated by chaparral which experiences a natural fire-return interval of approximately 35-100 years. Following a century of fire suppression and climate warming, the area has experienced a resurgence of intense fires over the last several decades, with almost every part of the uplands burning at some point.
+
+Riparian habitats in this area are either winter-deciduous broad-leaved woodlands of *Platanus racemosa*, *Salix* sp., and occasional *Populus trichocarpa* and *Alnus rhombifolia*, or a dense forest of evergreen *Quercus agrifolia* and *Umbellularia californica*. The former tends to grade into the latter with increasing elevation. In most fires, the riparian areas are not burned, or experience only light burning which the canopy largely survives. In some severe cases the riparian area is completely burned out, however, and if a major rain follows a fire, debris flows from mobilized sediment can also scour vegetation (e.g. the Montecito Debris Flow event in 2018, following the Thomas Fire). 
+
+This analysis focuses on quantifying fire impacts on riparian plants and streams. We start by segmenting out riparian areas themselves from a long timeseries of Landsat and topographic imagery. This is done in Google Earth Engine using a random forest model trained on:
+
+1) Phenological information (NDVI values by each of four seasons)
+2) Height above the nearest drainage (i.e. local relief relative to stream channel)
+3) Local terrain slope (riparian areas tend not to occur on high-slope cliff faces)
+
+The above are all assessed at 30 m spatial resolution (the limits of the Landsat archive) for each year from 2006 to 2020. An example set of images are given below:
+
+```{r riparian_masks, warning=FALSE}
+
+loadRiparianMask <- function(year)
+{
+  # Load target year's imagery
+  riparian_mask <- raster(here::here("riparian_masks",
+                                     paste("santa_ynez_front_range_classes_",
+                                           year,
+                                           ".tif", sep="")))
+  # Reproject to UTM Zone 11N 
+  projectRaster(riparian_mask, crs=crs("+init=EPSG:26911"))
+}
+
+ripdel_2006 <- loadRiparianMask(2006)
+ripdel_2007 <- loadRiparianMask(2007)
+ripdel_2008 <- loadRiparianMask(2008)
+ripdel_2009 <- loadRiparianMask(2009)
+ripdel_2014 <- loadRiparianMask(2014)
+ripdel_2015 <- loadRiparianMask(2015)
+ripdel_2016 <- loadRiparianMask(2016)
+ripdel_2017 <- loadRiparianMask(2017)
+ripdel_2018 <- loadRiparianMask(2018)
+ripdel_2019 <- loadRiparianMask(2019)
+
+plot(crop((ripdel_2006+ripdel_2007)>=0.5, c(230000,240000,3810000,3820000)), zlim=c(0,1))
+plot(crop((ripdel_2018+ripdel_2019)>=0.5, c(230000,240000,3810000,3820000)), zlim=c(0,1))
+
+```
+
+
+We'll be using burn values taken from the USDA Forest Service's Burned Area Emergency Response (BAER) tool. These will be based on thresholds on dNBR images produced by comparing pre- and post-fire Landsat imagery at 30 m resolution. Burn severity is thresholded into four categories: unaffected, low severity, medium severity, and high severity burns. The thresholds are typically set by BAER independently for each burn, but several of the fires never had thresholds set by BAER, so here we are using a single common thresholding for all six fires, based on the average cutoff for the three fires which were thresholded:
+
+jesusita
+95, 140, 220
+sherpa
+69, 146, 187
+tea
+80, 120, 192
+
+Therefore, the breakpoints here will be: 81, 135, 200. BUT these are rescaled by USDA FS, so after linear rescaling, these convert back to: 130, 400, 725
+
+
+```{r baer_fire_layers, warning=FALSE}
+
+# Load all dNBR burn imagery
+tea_dnbr <- raster(here::here("BAER","tea","tea_20081114_dnbr_alb.img"))
+jesusita_dnbr <- raster(here::here("BAER","jesusita","jesusita_20090509_barc256_utm_nad83.img"))*5-275
+sherpa_dnbr <- raster(here::here("BAER","sherpa","ca3453012005420160615_20150713_20160621_dnbr.tif"))
+whittier_dnbr <- raster(here::here("BAER","whittier","ca3456711995220170708_20170616_20170718_dnbr.tif"))
+thomas_dnbr <- raster(here::here("BAER","thomas","thomas_s2_20171128_21071228_dnbr.tif"))
+cave_dnbr <- raster(here::here("BAER","cave","ca3451411979320191125_20191113_20191129_dnbr.tif"))
+# Reproject all to common projection
+tea_dnbr <- projectRaster(tea_dnbr, ripdel_2006)
+jesusita_dnbr <- projectRaster(jesusita_dnbr, ripdel_2006)
+sherpa_dnbr <- projectRaster(sherpa_dnbr, ripdel_2006)
+whittier_dnbr <- projectRaster(whittier_dnbr, ripdel_2006)
+thomas_dnbr <- projectRaster(thomas_dnbr, ripdel_2006)
+cave_dnbr <- projectRaster(cave_dnbr, ripdel_2006)
+
+# Load Fire Perimeters
+tea_perimeter <- readOGR(here::here("fire_perimeters","tea.shp"))
+jesusita_perimeter <- readOGR(here::here("fire_perimeters","jesusita.shp"))
+sherpa_perimeter <- readOGR(here::here("fire_perimeters","sherpa.shp"))
+whittier_perimeter <- readOGR(here::here("fire_perimeters","whittier.shp"))
+thomas_perimeter <- readOGR(here::here("fire_perimeters","thomas.shp"))
+cave_perimeter <- readOGR(here::here("fire_perimeters","cave.shp"))
+# Reproject Fire Perimeters
+tea_perimeter <- spTransform(tea_perimeter, crs(ripdel_2006))
+jesusita_perimeter <- spTransform(jesusita_perimeter, crs(ripdel_2006))
+sherpa_perimeter <- spTransform(sherpa_perimeter, crs(ripdel_2006))
+whittier_perimeter <- spTransform(whittier_perimeter, crs(ripdel_2006))
+thomas_perimeter <- spTransform(thomas_perimeter, crs(ripdel_2006))
+cave_perimeter <- spTransform(cave_perimeter, crs(ripdel_2006))
+  
+# Mask dNBR Values by Fire Perimeters
+tea_dnbr <- mask(tea_dnbr, tea_perimeter, updatevalues=0)
+jesusita_dnbr <- mask(jesusita_dnbr, jesusita_perimeter, updatevalues=0)
+sherpa_dnbr <- mask(sherpa_dnbr, sherpa_perimeter, updatevalues=0)
+whittier_dnbr <- mask(whittier_dnbr, whittier_perimeter, updatevalues=0)
+thomas_dnbr <- mask(thomas_dnbr, thomas_perimeter, updatevalues=0)
+cave_dnbr <- mask(cave_dnbr, cave_perimeter, updatevalues=0)
+
+plot(tea_dnbr, zlimb=c(0,1000))
+plot(thomas_dnbr, zlimb=c(0,1000))
+
+severityCalculator <- function(dnbr)
+{
+  severity <- dnbr
+  severity[dnbr < 130] <- 0
+  severity[dnbr >= 130 & dnbr < 400] <- 1
+  severity[dnbr >= 400 & dnbr < 725] <- 2
+  severity[dnbr >= 725] <- 3
+  return(severity)
+}
+
+tea_severity = severityCalculator(tea_dnbr)
+jesusita_severity = severityCalculator(jesusita_dnbr)
+sherpa_severity = severityCalculator(sherpa_dnbr)
+whittier_severity = severityCalculator(whittier_dnbr)
+thomas_severity = severityCalculator(thomas_dnbr)
+cave_severity = severityCalculator(cave_dnbr)
+
+```
+
+Next we need to load imagery representing the watershed basins to be used for this analysis. We have 26 different riparian gauging stations and we're interested in the watershed that drains to each of them:
+
+```{r basin_delineations, warning=FALSE}
+
+basin_names <- list.files(here::here("basins"), pattern="*.tif")
+basin_names <- str_split(basin_names, pattern=".tif", simplify=TRUE)[,1]
+
+basins <- stack(here::here("basins",
+                           paste(basin_names,
+                                 ".tif", sep="")))
+basins <- projectRaster(basins, ripdel_2006)
+
+# Plot basin locations
+plot(sum(basins, na.rm=TRUE) > 0)
+
+basins_df <- as.data.frame(basins, xy=TRUE)
+
+# Print out the size of each basin, in m^2
+basin_areas <- cellStats(basins, stat=sum)*prod(res(basins))
+print(basin_areas)
+
+```
+
+Now that we've loaded all the basins, lets make a list of impacts for each basin by each fire. We have six fires and in total 29 basin-fire interactions. A few of our basins never burned during the relatively short period we are considering here (since 2006). 
+
+```{r fire_analysis_function_setup, warning=FALSE}
+
+# We'll run through, fire-by-fire and for each fire get impacts on each of its watersheds. 
+
+
+# Load list of locations in lat / lon for each stream measurement site
+stream_sites <- read_csv(here::here("stream_gauge_locations.csv")) 
+# Convert to SpatialPointsDataFrame
+stream_sites <- SpatialPointsDataFrame(coords=stream_sites[,c("Longitude","Latitude")], data=stream_sites, 
+                                       proj4string = CRS("+proj=longlat +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0"))
+stream_sites <- spTransform(stream_sites, CRS("+init=EPSG:26911"))
+# Get distance between all points in the raster domain and the target station points 
+
+
+# Statistical Analysis Functions
+#   Build Dataframe for One Fire
+getOverallDataFrame <- function(ripdel_1, ripdel_2, dnbr, severity, affected_streams)
+{
+  #   Riparian Zones - based on union of previous two years
+  riparian <- (ripdel_1+ripdel_2) >= 1.0
+  #   Generate Dataframe
+  overall_df <- basins_df[,c("x","y",affected_streams)]
+  overall_df$riparian <- as.data.frame(riparian)[,1]
+  overall_df$dnbr <- as.data.frame(dnbr)[,1]
+  overall_df$severity <- as.data.frame(severity)[,1]
+  overall_df <- overall_df %>% pivot_longer(cols=3:(length(affected_streams)+2), 
+                                    names_to="basin",
+                                    values_to="placeholder")
+  overall_df <- overall_df %>% drop_na(placeholder)
+}
+# Get Overall Fire Impacts (area in each severity)
+getOverallFireSummary <- function(input_df, affected_streams, fire_name)
+{
+  overall_summary <- input_df %>% 
+    group_by(basin, severity) %>% 
+    filter(basin %in% affected_streams) %>% 
+    tally() %>%
+    mutate(overall_area=n*prod(res(basins))) %>% 
+    mutate(fractional_area = overall_area/as.numeric(basin_areas[basin]))
+  # Add fire label
+  overall_summary$fire <- rep(fire_name, nrow(overall_summary))
+
+  print(kable(overall_summary) %>% kable_styling())
+  
+  return(overall_summary)
+}
+
+# Get total riparian vs. upland area for a basin
+getHabitatAreas <- function(input_df, affected_streams)
+{
+  riparian_area <- input_df %>% 
+    filter(basin %in% affected_streams) %>%
+    group_by(basin, riparian) %>%
+    tally() %>%
+    mutate(area=n*prod(res(basins)))
+}
+# Get the area of a given habitat type in a given basin, from the above data return
+getGroupArea <- function(habitat_area, current_basin, is_riparian)
+{
+  
+  filter(habitat_area, basin==current_basin, riparian==is_riparian)$area
+}
+# Get impact fractions for upland and riparian areas for a given basin x fire
+getHabitatFireSummary <- function(input_df, affected_streams, habitat_area, fire_name)
+{
+  habitat_summary <- input_df %>% 
+    group_by(basin, riparian, severity) %>% 
+    filter(basin %in% affected_streams) %>% 
+    tally() %>%
+    mutate(overall_area=n*prod(res(basins))) %>%
+    mutate(fractional_area= overall_area / getGroupArea(habitat_area, basin[[1]], riparian[[1]]))
+  habitat_summary$fire <- rep(fire_name, nrow(habitat_summary))
+  
+  print(kable(habitat_summary) %>% kable_styling())
+  
+  return(habitat_summary)
+}
+# Get local riparian impacts within 100 m of each stream station
+# Near-station Area
+getLocalFireSummary <- function(site_name, input_df, gauge_locations, fire_name)
+{
+  print(paste("Getting Local Riparian Impacts around Gauge ",
+              site_name,
+              sep=""))
+  input_df$dist <- sp::spDists(as.matrix(input_df[,c("x","y")]),as.matrix(coordinates(gauge_locations[gauge_locations$Stream==site_name,])))
+  output <- input_df %>% filter(dist < 100,
+                      riparian==TRUE,
+                      basin==site_name) %>% 
+    group_by(severity) %>%
+    tally() %>%
+    mutate(overall_area=n*prod(res(basins)))
+  total_area <- sum(output$overall_area)
+  output$fractional_area <- output$overall_area/total_area
+  output$fire <- rep(fire_name, nrow(output))
+  output$basin <- rep(site_name, nrow(output))
+  
+  print(kable(output) %>% kable_styling())
+  return(output)
+}
+# Approximate corridor width as number of riparian pixels in 100 m reach divided by 100 m length
+getApproxRiparianWidth <- function(local_fire_summary)
+{
+  corridor_width <- local_fire_summary %>% 
+    group_by(basin) %>%
+    summarise(width = sum(overall_area/100))
+  corridor_width$fire <- rep(local_fire_summary[1,]$fire, nrow(corridor_width))
+  
+  print(kable(corridor_width) %>% kable_styling())
+  
+  return(corridor_width)
+}
+# Reformat to be inserted into Excel
+reformatForExcel <- function(overall_summary, habitat_summary, local_summary, stream_name)
+{
+  # *** Overall Data ***
+  # Pivot to wider data series
+  overall_wide <- pivot_wider(overall_summary[,c("basin","severity","fractional_area")], names_from=severity, values_from=fractional_area)
+  # Change names
+  names(overall_wide) <- c(names(overall_wide)[1],paste("overall_",names(overall_wide)[2:ncol(overall_wide)],sep=""))
+  # Drop any NA data columns (where burn severity values from outside BAER extent)
+  overall_wide <- overall_wide[,!grepl("*NA", names(overall_wide))]
+  
+  # *** Riparian and Upland Data ***
+  # Pivot to wider data series
+  habitat_wide <- pivot_wider(habitat_summary[,c("basin","severity","riparian","fractional_area")], names_from=severity, values_from=fractional_area)
+  # Change names
+  names(habitat_wide) <- c(names(habitat_wide)[1],paste("overall",names(habitat_wide)[2:ncol(habitat_wide)]))
+  # Drop any NA data columns (where burn severity values from outside BAER extent)
+  habitat_wide <- habitat_wide[,!grepl("*NA", names(habitat_wide))]
+  
+  # *** Local Riparian Data ***
+  # Pivot to wider data series
+  local_wide <- pivot_wider(local_summary[,c("basin","severity","fractional_area")], names_from=severity, values_from=fractional_area)
+  # Change names
+  names(local_wide) <- c(names(local_wide)[1],paste("local",names(local_wide)[2:ncol(local_wide)]))
+  # Drop any NA data columns (where burn severity values from outside BAER extent)
+  local_wide <- local_wide[,!grepl("*NA", names(local_wide))]
+  
+  # Combine all into one dataframe
+  riparian_wide <- habitat_wide[habitat_wide$`overall riparian`==TRUE,-2]
+  names(riparian_wide) <- c("basin",paste("riparian_",0:3,sep=""))
+  upland_wide <- habitat_wide[habitat_wide$`overall riparian`==FALSE,-2]
+  names(upland_wide) <- c("basin",paste("upland_",0:3,sep=""))
+  habitat_wide <- merge(overall_wide, riparian_wide,by="basin")
+  habitat_wide <- merge(habitat_wide, upland_wide,by="basin")
+  habitat_wide <- merge(habitat_wide, local_wide,by="basin")
+  
+  # Output to disk!
+  write_csv(habitat_wide, here::here("output_tables",paste(stream_name,".csv",sep="")))
+}
+
+```
+
+```{r tea, warning=FALSE}
+
+# ************************************************************************************************
+# ************************************ Tea Fire, in 2008 ************************************
+# ************************************************************************************************
+
+#   Get Relevant Stream Sites
+tea_affected_streams <- c("mission_at_rocky_nook", "rattlesnake_lower", "sycamore", "cold_spring")
+tea_stream_sites <- stream_sites[stream_sites$Stream %in% tea_affected_streams,]
+#   Get Overall Dataframe
+tea_df <- getOverallDataFrame(ripdel_2006,ripdel_2007,tea_dnbr,tea_severity,tea_affected_streams)
+#   Coverage for riparian vs. upland
+tea_habitat_areas <- getHabitatAreas(tea_df, tea_affected_streams)
+#   Run Statistics
+tea_overall_summary <- getOverallFireSummary(tea_df, tea_affected_streams, "tea")
+tea_habitat_summary <- getHabitatFireSummary(tea_df, tea_affected_streams, tea_habitat_areas, "tea")
+tea_local_summary <- bind_rows(lapply(tea_affected_streams, getLocalFireSummary, input_df=tea_df, gauge_locations=tea_stream_sites, fire_name="tea"))
+tea_corridor_width <- getApproxRiparianWidth(tea_local_summary)
+reformatForExcel(tea_overall_summary, tea_habitat_summary, tea_local_summary, "tea")
+rm(tea_df) 
+
+```
+
+
+```{r jesusita, warning=FALSE}
+
+# ************************************************************************************************
+# ************************************ Jesusita Fire, in 2009 ************************************
+# ************************************************************************************************
+
+#   Get Relevant Stream Sites
+jesusita_affected_streams <- c("san_antonio_lower", "san_antonio_upper", "san_roque_lower","san_roque_upper","mission_sbbg_upper","mission_sbbg_lower","mission_at_rocky_nook","rattlesnake_upper","rattlesnake_lower","sycamore","cold_spring")
+jesusita_stream_sites <- stream_sites[stream_sites$Stream %in% jesusita_affected_streams,]
+#   Get Overall Dataframe
+jesusita_df <- getOverallDataFrame(ripdel_2007,ripdel_2008,jesusita_dnbr,jesusita_severity,jesusita_affected_streams)
+#   Coverage for riparian vs. upland
+jesusita_habitat_areas <- getHabitatAreas(jesusita_df, jesusita_affected_streams)
+#   Run Statistics
+jesusita_overall_summary <- getOverallFireSummary(jesusita_df, jesusita_affected_streams, "jesusita")
+jesusita_habitat_summary <- getHabitatFireSummary(jesusita_df, jesusita_affected_streams, jesusita_habitat_areas, "jesusita")
+jesusita_local_summary <- bind_rows(lapply(jesusita_affected_streams, getLocalFireSummary, input_df=jesusita_df, gauge_locations=jesusita_stream_sites, fire_name="jesusita"))
+jesusita_corridor_width <- getApproxRiparianWidth(jesusita_local_summary)
+reformatForExcel(jesusita_overall_summary, jesusita_habitat_summary, jesusita_local_summary, "jesusita")
+rm(jesusita_df)
+
+```
+
+```{r sherpa, warning=FALSE}
+
+# ************************************************************************************************
+# ************************************ Sherpa Fire, in 2016 ************************************
+# ************************************************************************************************
+
+#   Get Relevant Stream Sites
+sherpa_affected_streams <- c("refugio","el_capitan_lower","el_capitan_usual")
+sherpa_stream_sites <- stream_sites[stream_sites$Stream %in% sherpa_affected_streams,]
+#   Get Overall Dataframe
+sherpa_df <- getOverallDataFrame(ripdel_2014,ripdel_2015,sherpa_dnbr,sherpa_severity,sherpa_affected_streams)
+#   Coverage for riparian vs. upland
+sherpa_habitat_areas <- getHabitatAreas(sherpa_df, sherpa_affected_streams)
+#   Run Statistics
+sherpa_overall_summary <- getOverallFireSummary(sherpa_df, sherpa_affected_streams, "sherpa")
+sherpa_habitat_summary <- getHabitatFireSummary(sherpa_df, sherpa_affected_streams, sherpa_habitat_areas, "sherpa")
+sherpa_local_summary <- bind_rows(lapply(sherpa_affected_streams, getLocalFireSummary, input_df=sherpa_df, gauge_locations=sherpa_stream_sites, fire_name="sherpa"))
+sherpa_corridor_width <- getApproxRiparianWidth(sherpa_local_summary)
+reformatForExcel(sherpa_overall_summary, sherpa_habitat_summary, sherpa_local_summary, "sherpa")
+rm(sherpa_df)
+
+```
+
+
+```{r whittier, warning=FALSE}
+
+# ************************************************************************************************
+# ************************************ Whittier Fire, in 2017 ************************************
+# ************************************************************************************************
+
+#   Get Relevant Stream Sites
+whittier_affected_streams <- c("el_capitan_lower","el_capitan_usual","el_capitan_high_up")
+whittier_stream_sites <- stream_sites[stream_sites$Stream %in% whittier_affected_streams,]
+#   Get Overall Dataframe
+whittier_df <- getOverallDataFrame(ripdel_2015,ripdel_2016,whittier_dnbr,whittier_severity,whittier_affected_streams)
+#   Coverage for riparian vs. upland
+whittier_habitat_areas <- getHabitatAreas(whittier_df, whittier_affected_streams)
+#   Run Statistics
+whittier_overall_summary <- getOverallFireSummary(whittier_df, whittier_affected_streams, "whittier")
+whittier_habitat_summary <- getHabitatFireSummary(whittier_df, whittier_affected_streams, whittier_habitat_areas, "whittier")
+whittier_local_summary <- bind_rows(lapply(whittier_affected_streams, getLocalFireSummary, input_df=whittier_df, gauge_locations=whittier_stream_sites, fire_name="whittier"))
+whittier_corridor_width <- getApproxRiparianWidth(whittier_local_summary)
+reformatForExcel(whittier_overall_summary, whittier_habitat_summary, whittier_local_summary, "whittier")
+rm(whittier_df)
+
+```
+
+
+```{r thomas, warning=FALSE}
+
+# ************************************************************************************************
+# ************************************ Thomas Fire, in 2017 ************************************
+# ************************************************************************************************
+
+#   Get Relevant Stream Sites
+thomas_affected_streams <- c("sycamore","cold_spring","san_ysidro","romero","gobernador","toro")
+thomas_stream_sites <- stream_sites[stream_sites$Stream %in% thomas_affected_streams,]
+#   Get Overall Dataframe
+thomas_df <- getOverallDataFrame(ripdel_2015,ripdel_2016,thomas_dnbr,thomas_severity,thomas_affected_streams)
+#   Coverage for riparian vs. upland
+thomas_habitat_areas <- getHabitatAreas(thomas_df, thomas_affected_streams)
+#   Run Statistics
+thomas_overall_summary <- getOverallFireSummary(thomas_df, thomas_affected_streams, "thomas")
+thomas_habitat_summary <- getHabitatFireSummary(thomas_df, thomas_affected_streams, thomas_habitat_areas, "thomas")
+thomas_local_summary <- bind_rows(lapply(thomas_affected_streams, getLocalFireSummary, input_df=thomas_df, gauge_locations=thomas_stream_sites, fire_name="thomas"))
+thomas_corridor_width <- getApproxRiparianWidth(thomas_local_summary)
+reformatForExcel(thomas_overall_summary, thomas_habitat_summary, thomas_local_summary, "thomas")
+rm(thomas_df)
+
+```
+
+
+```{r cave, warning=FALSE}
+
+# ************************************************************************************************
+# ************************************ Cave Fire, in 2019 ************************************
+# ************************************************************************************************
+
+#   Get Relevant Stream Sites
+cave_affected_streams <- c("maria_ygnacio","san_antonio_lower","san_antonio_upper")
+cave_stream_sites <- stream_sites[stream_sites$Stream %in% cave_affected_streams,]
+#   Get Overall Dataframe
+cave_df <- getOverallDataFrame(ripdel_2017,ripdel_2018,cave_dnbr,cave_severity,cave_affected_streams)
+#   Coverage for riparian vs. upland
+cave_habitat_areas <- getHabitatAreas(cave_df, cave_affected_streams)
+#   Run Statistics
+cave_overall_summary <- getOverallFireSummary(cave_df, cave_affected_streams, "cave")
+cave_habitat_summary <- getHabitatFireSummary(cave_df, cave_affected_streams, cave_habitat_areas, "cave")
+cave_local_summary <- bind_rows(lapply(cave_affected_streams, getLocalFireSummary, input_df=cave_df, gauge_locations=cave_stream_sites, fire_name="cave"))
+cave_corridor_width <- getApproxRiparianWidth(cave_local_summary)
+reformatForExcel(cave_overall_summary, cave_habitat_summary, cave_local_summary, "cave")
+rm(cave_df)
+
+```
+
+
+Now we want to generate some stats related to fire recovery at each site. Let's focus on Mission Creek and the Jesusita Fire:
+
+```{r}
+
+
+getRecoveryDataframe <- function(ripdel, dnbr, severity, ndvi, affected_streams)
+{
+  #   Riparian Zones - based on union of previous two years
+  riparian <- ripdel
+  #   Generate Dataframe
+  overall_df <- basins_df[,c("x","y",affected_streams)]
+  overall_df$riparian <- as.data.frame(riparian)[,1]
+  overall_df$dnbr <- as.data.frame(dnbr)[,1]
+  overall_df$severity <- as.data.frame(severity)[,1]
+  overall_df <- cbind(overall_df, ndvi)
+  overall_df <- overall_df %>% pivot_longer(cols=3:(length(affected_streams)+2), 
+                                    names_to="basin",
+                                    values_to="placeholder")
+  overall_df <- overall_df %>% pivot_longer(cols=6:(ncol(ndvi)+5), 
+                                    names_to="year",
+                                    values_to="ndvi")
+  overall_df$year <- as.numeric(substr(overall_df$year, 2,5))
+  overall_df <- overall_df %>% drop_na(placeholder)
+}
+
+# Landsat timeseries of average summer greenness (May 1 to Sept. 31)
+ndvi_timeseries <- stack(raster(here::here("summer_greenness","2013_summer_greenness.tif")),
+                         raster(here::here("summer_greenness","2014_summer_greenness.tif")),
+                         raster(here::here("summer_greenness","2015_summer_greenness.tif")),
+                         raster(here::here("summer_greenness","2016_summer_greenness.tif")),
+                         raster(here::here("summer_greenness","2017_summer_greenness.tif")),
+                         raster(here::here("summer_greenness","2018_summer_greenness.tif")),
+                         raster(here::here("summer_greenness","2019_summer_greenness.tif")),
+                         raster(here::here("summer_greenness","2020_summer_greenness.tif")),
+                         raster(here::here("summer_greenness","2021_summer_greenness.tif")))
+ndvi_timeseries <- projectRaster(ndvi_timeseries, crs=crs("+init=EPSG:26911"))
+ndvi_timeseries <- crop(ndvi_timeseries, jesusita_dnbr)
+ndvi_df <- as.data.frame(ndvi_timeseries)
+
+# Long-term stable riparian zones - about 3/6 scenes from 2014 to 2019 assessed as 'riparian'
+long_term_ripdel <- ripdel_2014+ripdel_2015+ripdel_2016+ripdel_2017+ripdel_2018+ripdel_2019
+long_term_ripdel <- long_term_ripdel > 2
+long_term_ripdel <- projectRaster(long_term_ripdel, crs=crs("+init=EPSG:26911"))
+long_term_ripdel <- crop(long_term_ripdel, jesusita_dnbr)
+
+# Generate riparian recovery data
+#jesusita_recovery_data <- getRecoveryDataframe(long_term_ripdel, jesusita_dnbr, jesusita_severity, ndvi_df, c("cold_spring", "mission_at_rocky_nook", "mission_sbbg_lower", "mission_sbbg_upper", "rattlesnake_lower", "rattlesnake_upper", "san_antonio_lower", "san_antonio_upper", "san_roque_lower", "san_roque_upper", "sycamore"))
+jesusita_recovery_data <- getRecoveryDataframe(long_term_ripdel, jesusita_dnbr, jesusita_severity, ndvi_df, c("rattlesnake_upper","mission_sbbg_upper","san_antonio_upper", "san_roque_lower"))
+
+# Get local riparian impacts within 100 m of each stream station
+# Near-station Area
+getLocalFireRecovery <- function(site_name, input_df, gauge_locations, fire_name)
+{
+  input_df$dist <- sp::spDists(as.matrix(input_df[,c("x","y")]),as.matrix(coordinates(gauge_locations[gauge_locations$Stream==site_name,])))
+  
+  output_df <- input_df %>% filter(dist <= 100)
+}
+
+
+
+# Site-level recovery trends for Rattlesnake Upper
+target_basin <- "rattlesnake_upper"
+site_recovery <- jesusita_recovery_data %>% filter(basin == target_basin, riparian==1)
+site_recovery_summary <- site_recovery %>% 
+  group_by(severity, year) %>% 
+  summarize(ndvi_mean = mean(ndvi),
+            ndvi_median = median(ndvi))
+precip <- read_csv(here::here("climate","hydro.csv"))
+site_recovery_summary <- merge(site_recovery_summary, precip, by="year")
+ggplot() + 
+    geom_line(data=site_recovery_summary, aes(x=year, y=ndvi_mean, group=severity, col=(severity)), size=2) + 
+    geom_line(data=precip, aes(x=year,y=SPEI_12/20+.15), col="red", size=2) + 
+    geom_line(data=precip, aes(x=year,y=SPEI_3/20+0.15), col="orange", size=2) + 
+    scale_x_continuous(breaks=seq(2013,2021)) + 
+    scale_y_continuous(breaks=seq(2,6)*0.05,
+                       sec.axis=sec_axis(trans=~(.-0.15)*20, name="SPEI", breaks=seq(-3,3))) + 
+    xlab("Year") + 
+    ylab("Growing Season NDVI") + 
+    ggtitle("Rattlesnake Upper")
+
+local_recovery_rattlesnake <- getLocalFireRecovery(target_basin,jesusita_recovery_data, stream_sites, "jesusita") %>%
+  filter(basin==target_basin, riparian == 1) %>% 
+  group_by(year) %>%
+  summarize(ndvi_mean = mean(ndvi),
+            ndvi_median = median(ndvi),
+            basin = target_basin)
+
+
+
+# Site-level recovery trends for Rattlesnake Upper
+target_basin = "mission_sbbg_upper"
+site_recovery <- jesusita_recovery_data %>% filter(basin == target_basin, riparian==1)
+site_recovery_summary <- site_recovery %>% 
+  group_by(severity, year) %>% 
+  summarize(ndvi_mean = mean(ndvi),
+            ndvi_median = median(ndvi))
+precip <- read_csv(here::here("climate","hydro.csv"))
+site_recovery_summary <- merge(site_recovery_summary, precip, by="year")
+ggplot() + 
+    geom_line(data=site_recovery_summary, aes(x=year, y=ndvi_mean, group=severity, col=(severity)), size=2) + 
+    geom_line(data=precip, aes(x=year,y=SPEI_12/20+.15), col="red", size=2) + 
+    geom_line(data=precip, aes(x=year,y=SPEI_3/20+0.15), col="orange", size=2) + 
+    scale_x_continuous(breaks=seq(2013,2021)) + 
+    scale_y_continuous(breaks=seq(2,6)*0.05,
+                       sec.axis=sec_axis(trans=~(.-0.15)*20, name="SPEI", breaks=seq(-3,3))) + 
+    xlab("Year") + 
+    ylab("Growing Season NDVI") + 
+    ggtitle("Mission SBBG Upper")
+
+local_recovery_mission <- getLocalFireRecovery(target_basin,jesusita_recovery_data, stream_sites, "jesusita") %>%
+  filter(basin==target_basin, riparian == 1) %>% 
+  group_by(year) %>%
+  summarize(ndvi_mean = mean(ndvi),
+            ndvi_median = median(ndvi),
+            basin = target_basin)
+
+
+# Site-level recovery trends for Rattlesnake Upper
+target_basin = "san_roque_lower"
+site_recovery <- jesusita_recovery_data %>% filter(basin == target_basin, riparian==1)
+site_recovery_summary <- site_recovery %>% 
+  group_by(severity, year) %>% 
+  summarize(ndvi_mean = mean(ndvi),
+            ndvi_median = median(ndvi))
+precip <- read_csv(here::here("climate","hydro.csv"))
+site_recovery_summary <- merge(site_recovery_summary, precip, by="year")
+ggplot() + 
+    geom_line(data=site_recovery_summary, aes(x=year, y=ndvi_mean, group=severity, col=(severity)), size=2) + 
+    geom_line(data=precip, aes(x=year,y=SPEI_12/20+.15), col="red", size=2) + 
+    geom_line(data=precip, aes(x=year,y=SPEI_3/20+0.15), col="orange", size=2) + 
+    scale_x_continuous(breaks=seq(2013,2021)) + 
+    scale_y_continuous(breaks=seq(2,6)*0.05,
+                       sec.axis=sec_axis(trans=~(.-0.15)*20, name="SPEI", breaks=seq(-3,3))) + 
+    xlab("Year") + 
+    ylab("Growing Season NDVI")
+
+local_recovery_san_roque <- getLocalFireRecovery(target_basin,jesusita_recovery_data, stream_sites, "jesusita") %>%
+  filter(basin==target_basin, riparian == 1) %>% 
+  group_by(year) %>%
+  summarize(ndvi_mean = mean(ndvi),
+            ndvi_median = median(ndvi),
+            basin = target_basin)
+
+# Site-level recovery trends for Rattlesnake Upper
+target_basin = "san_antonio_upper"
+site_recovery <- jesusita_recovery_data %>% filter(basin == target_basin, riparian==1)
+site_recovery_summary <- site_recovery %>% 
+  group_by(severity, year) %>% 
+  summarize(ndvi_mean = mean(ndvi),
+            ndvi_median = median(ndvi))
+precip <- read_csv(here::here("climate","hydro.csv"))
+site_recovery_summary <- merge(site_recovery_summary, precip, by="year")
+ggplot() + 
+    geom_line(data=site_recovery_summary, aes(x=year, y=ndvi_mean, group=severity, col=(severity)), size=2) + 
+    geom_line(data=precip, aes(x=year,y=SPEI_12/20+.15), col="red", size=2) + 
+    geom_line(data=precip, aes(x=year,y=SPEI_3/20+0.15), col="orange", size=2) + 
+    scale_x_continuous(breaks=seq(2013,2021)) + 
+    scale_y_continuous(breaks=seq(2,6)*0.05,
+                       sec.axis=sec_axis(trans=~(.-0.15)*20, name="SPEI", breaks=seq(-3,3))) + 
+    xlab("Year") + 
+    ylab("Growing Season NDVI")
+
+local_recovery_san_antonio <- getLocalFireRecovery(target_basin,jesusita_recovery_data, stream_sites, "jesusita") %>%
+  filter(basin==target_basin, riparian == 1) %>% 
+  group_by(year) %>%
+  summarize(ndvi_mean = mean(ndvi),
+            ndvi_median = median(ndvi),
+            basin = target_basin)
+
+all_local_recovery <- rbind(local_recovery_rattlesnake, 
+                            local_recovery_mission,
+                            local_recovery_san_roque,
+                            local_recovery_san_antonio)
+
+```
+
+
+
+

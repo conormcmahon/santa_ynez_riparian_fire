@@ -1,0 +1,11 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+BAER/
+basins/
+climate/
+fire_perimeters/
+output_tables/
+riparian_masks/
+summer_greenness/
